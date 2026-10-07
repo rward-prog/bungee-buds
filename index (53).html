@@ -1,0 +1,1320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tethered</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #140c1c; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: crisp-edges; image-rendering: pixelated; outline: none; }
+</style>
+</head>
+<body>
+<canvas id="game" width="480" height="272" aria-label="Tethered: a two-player rope platformer"></canvas>
+<noscript>Tethered needs JavaScript turned on.</noscript>
+<script>
+/* TETHERED - two players, one rope, one keyboard.
+   Sections: SIM (physics + rules), LEVELS (ASCII maps), GAME (drawing, input, menus). */
+
+/* ================= SIM: physics + rules (no DOM) ================= */
+const TILE = 16, VW = 480, VH = 272, ROWS = 17;
+
+const CFG = {
+  gravity: 1000, maxFall: 430,
+  runMax: 104, runAccel: 1150, airAccel: 700, friction: 1500, airDrag: 120, brake: 1.8,
+  jumpV: -292, jumpCut: -105, coyote: 0.09, buffer: 0.11,
+  ropeLen: 44, ropeK: 46, ropeDamp: 3, ropeMaxAcc: 3400,
+  dislodgeAcc: 1750, tautFriction: 650, dislodgePop: 150,
+  reelRate: 160, reelRelease: 240, reelMin: 14, reelMaxAcc: 1380, reelLift: 70,
+  size: 10, hangLimit: 1e9, stackBoost: 0.4, lowTime: 3, killY: VH + 24,
+  yankTime: 0.45, spawnInv: 1.2, exitHold: 0.5
+};
+
+const T_EMPTY = 0, T_SOLID = 1, T_SPIKE = 2, T_CANNON = 3;
+
+/* ---------- level parsing ---------- */
+function parseLevel(def) {
+  const rows = def.rows.slice();
+  while (rows.length < ROWS) rows.unshift('');
+  const w = Math.max.apply(null, rows.map(r => r.length));
+  const grid = rows.map(() => new Uint8Array(w));
+  const lv = {
+    name: def.name, theme: def.theme || 0, hint: def.hint || '',
+    w, h: ROWS, pixelW: w * TILE, grid,
+    start: null, exit: null, checkpoints: [], stars: [],
+    chaser: def.chaser ? Object.assign({ kind: 'left', speed: 40, delay: 3, lead: 460, startY: 272 }, def.chaser) : null,
+    cannons: [], cannonCfg: Object.assign({ period: 3.0, speed: 75 }, def.cannon || {})
+  };
+  rows.forEach((r, ty) => {
+    for (let tx = 0; tx < w; tx++) {
+      const c = r[tx] || '.';
+      const cx = tx * TILE + TILE / 2, floorY = (ty + 1) * TILE;
+      if (c === '#') grid[ty][tx] = T_SOLID;
+      else if (c === '^') grid[ty][tx] = T_SPIKE;
+      else if (c === '<' || c === '>') { grid[ty][tx] = T_CANNON; lv.cannons.push({ tx, ty, dir: c === '>' ? 1 : -1, cx, cy: ty * TILE + TILE / 2 }); }
+      else if (c === 'S') lv.start = { cx, floorY, tx: -1 };
+      else if (c === 'E') lv.exit = { x: cx - 16, y: floorY - 32, w: 32, h: 32, cx, floorY };
+      else if (c === 'C') lv.checkpoints.push({ cx, floorY, tx, ty });
+      else if (c === '*') lv.stars.push({ x: cx, y: ty * TILE + TILE / 2 });
+    }
+  });
+  // lowest walkable surface in the level: dropping below it means you fell into a pit
+  let low = 0;
+  for (let ty = 0; ty < ROWS; ty++) for (let tx = 0; tx < w; tx++) {
+    if (grid[ty][tx] === T_SOLID && (ty === 0 || grid[ty - 1][tx] !== T_SOLID)) low = Math.max(low, ty * TILE);
+  }
+  lv.deathY = low;
+  return lv;
+}
+
+function solidAt(lv, tx, ty) {
+  if (tx < 0 || tx >= lv.w) return true;      // invisible walls at the level edges
+  if (ty < 0 || ty >= lv.h) return false;
+  const v = lv.grid[ty][tx];
+  return v === T_SOLID || v === T_CANNON;
+}
+
+/* ---------- players ---------- */
+function makePlayer(i) {
+  const s = CFG.size;
+  return {
+    i, x: 0, y: 0, w: s, h: s, vx: 0, vy: 0,
+    onGround: false, support: -1, coyote: 0, buffer: 0,
+    face: 1, air: 0, dx: 0, ghost: null, inv: 0, jumping: false, low: 0
+  };
+}
+
+function placeAtCheckpoint(q, cp) {
+  const cx = cp.cx + (q.i === 0 ? -8 : 8);
+  q.x = cx - q.w / 2; q.y = cp.floorY - q.h;
+  q.vx = 0; q.vy = 0; q.onGround = false; q.support = -1;
+  q.coyote = 0; q.buffer = 0; q.air = 0; q.low = 0; q.ghost = null; q.inv = CFG.spawnInv;
+}
+
+function createSim(lv) {
+  const sim = {
+    lv, time: 0, started: false, done: false,
+    p: [makePlayer(0), makePlayer(1)],
+    stars: lv.stars.map(s => ({ x: s.x, y: s.y, got: false })),
+    starCount: 0, cp: lv.start, deaths: 0, deathsBy: [0, 0],
+    exitTimer: 0, stretch: 0, events: [], noRope: false,
+    ropeEff: CFG.ropeLen, reeling: false,
+    bullets: [], cannonT: lv.cannons.map((c, i) => (i * 1.1) % lv.cannonCfg.period), noCannons: false, noChasers: false,
+    chaser: lv.chaser ? { kind: lv.chaser.kind, speed: lv.chaser.speed, delay: lv.chaser.delay, pause: 0, pos: lv.chaser.kind === 'up' ? lv.chaser.startY : lv.start.cx + lv.chaser.lead } : null
+  };
+  placeAtCheckpoint(sim.p[0], sim.cp);
+  placeAtCheckpoint(sim.p[1], sim.cp);
+  sim.p[0].inv = 0; sim.p[1].inv = 0;   // no blinking on the very first spawn
+  return sim;
+}
+
+function pressJump(sim, i) { sim.p[i].buffer = CFG.buffer; }
+
+/* ---------- tile collision ---------- */
+function moveX(lv, q, amt) {
+  if (!amt) return;
+  q.x += amt;
+  const top = Math.floor(q.y / TILE), bot = Math.floor((q.y + q.h - 0.001) / TILE);
+  if (amt > 0) {
+    const tx = Math.floor((q.x + q.w - 0.001) / TILE);
+    for (let ty = top; ty <= bot; ty++) if (solidAt(lv, tx, ty)) { q.x = tx * TILE - q.w; q.vx = 0; break; }
+  } else {
+    const tx = Math.floor(q.x / TILE);
+    for (let ty = top; ty <= bot; ty++) if (solidAt(lv, tx, ty)) { q.x = (tx + 1) * TILE; q.vx = 0; break; }
+  }
+}
+
+function moveY(lv, q, amt) {
+  q.y += amt;
+  q.onGround = false;
+  const l = Math.floor(q.x / TILE), r = Math.floor((q.x + q.w - 0.001) / TILE);
+  if (amt >= 0) {
+    const ty = Math.floor((q.y + q.h - 0.001) / TILE);
+    for (let tx = l; tx <= r; tx++) if (solidAt(lv, tx, ty)) {
+      q.y = ty * TILE - q.h; if (q.vy > 0) q.vy = 0; q.onGround = true; q.support = -1; break;
+    }
+  } else {
+    const ty = Math.floor(q.y / TILE);
+    for (let tx = l; tx <= r; tx++) if (solidAt(lv, tx, ty)) { q.y = (ty + 1) * TILE; q.vy = 0; break; }
+  }
+}
+
+function wallBeside(lv, q, dirx) {
+  const top = Math.floor(q.y / TILE), bot = Math.floor((q.y + q.h - 0.001) / TILE);
+  const tx = dirx > 0 ? Math.floor((q.x + q.w + 0.5) / TILE) : Math.floor((q.x - 0.5) / TILE);
+  for (let ty = top; ty <= bot; ty++) if (solidAt(lv, tx, ty)) return true;
+  return false;
+}
+
+function touchesSpike(lv, q) {
+  const l = Math.floor((q.x + 1) / TILE), r = Math.floor((q.x + q.w - 1) / TILE);
+  const t = Math.floor((q.y + 1) / TILE), b = Math.floor((q.y + q.h - 1) / TILE);
+  for (let ty = t; ty <= b; ty++) for (let tx = l; tx <= r; tx++) {
+    if (tx < 0 || tx >= lv.w || ty < 0 || ty >= lv.h) continue;
+    if (lv.grid[ty][tx] !== T_SPIKE) continue;
+    const sx = tx * TILE + 3, sy = ty * TILE + 8, sw = TILE - 6, sh = 8;
+    if (q.x + q.w - 1 > sx && q.x + 1 < sx + sw && q.y + q.h - 1 > sy && q.y + 1 < sy + sh) return true;
+  }
+  return false;
+}
+
+/* ---------- death / respawn ---------- */
+function killPlayers(sim, idxs) {
+  sim.deaths++;
+  sim.bullets.length = 0;
+  const cp = sim.cp;
+  if (sim.chaser) {
+    const ch = sim.chaser, lc = sim.lv.chaser;
+    ch.pause = 1.8;
+    ch.pos = ch.kind === 'up' ? Math.max(ch.pos, cp.floorY + 90) : Math.max(ch.pos, cp.cx + lc.lead * 0.9);
+  }
+  idxs.forEach(i => {
+    sim.deathsBy[i]++;
+    const q = sim.p[i];
+    sim.events.push({ type: 'die', i, x: q.x + q.w / 2, y: Math.min(q.y + q.h / 2, VH - 4) });
+  });
+  if (idxs.length === 2) {
+    placeAtCheckpoint(sim.p[0], cp); placeAtCheckpoint(sim.p[1], cp);
+    return;
+  }
+  const i = idxs[0], j = 1 - i, q = sim.p[i], o = sim.p[j];
+  placeAtCheckpoint(q, cp);
+  // the partner gets yanked along the rope to the checkpoint
+  const tmp = makePlayer(j); placeAtCheckpoint(tmp, cp);
+  o.ghost = { t: 0, dur: CFG.yankTime, fx: o.x, fy: o.y, tx: tmp.x, ty: tmp.y };
+  o.vx = 0; o.vy = 0; o.support = -1; o.onGround = false;
+  sim.events.push({ type: 'yank', i: j });
+}
+
+/* manual "take us back to the checkpoint" (Y key): not a death, no fault counted */
+function recallToCheckpoint(sim) {
+  if (sim.done) return;
+  const cp = sim.cp;
+  sim.bullets.length = 0;
+  if (sim.chaser) {
+    const ch = sim.chaser, lc = sim.lv.chaser;
+    ch.pause = 1.8;
+    ch.pos = ch.kind === 'up' ? Math.max(ch.pos, cp.floorY + 90) : Math.max(ch.pos, cp.cx + lc.lead * 0.9);
+  }
+  sim.events.push({ type: 'recall', x: sim.p[0].x, y: sim.p[0].y }, { type: 'recall', x: sim.p[1].x, y: sim.p[1].y });
+  placeAtCheckpoint(sim.p[0], cp); placeAtCheckpoint(sim.p[1], cp);
+}
+
+/* ---------- main step (fixed dt) ---------- */
+// inputs[i] = { dir: -1|0|1, held: bool, reel: bool }
+function step(sim, dt, inputs) {
+  if (sim.done) return;
+  const lv = sim.lv, p = sim.p;
+
+  if (!sim.started && (inputs[0].dir || inputs[1].dir || inputs[0].held || inputs[1].held)) sim.started = true;
+  if (sim.started) sim.time += dt;
+
+  const prevDx = [p[0].dx, p[1].dx];
+
+  // yank animation
+  for (let i = 0; i < 2; i++) {
+    const q = p[i];
+    if (!q.ghost) continue;
+    const g = q.ghost; g.t += dt;
+    const u = Math.min(1, g.t / g.dur), e = u * u;
+    const nx = g.fx + (g.tx - g.fx) * e, ny = g.fy + (g.ty - g.fy) * e;
+    q.dx = nx - q.x; q.x = nx; q.y = ny; q.vx = 0; q.vy = 0;
+    if (u >= 1) { q.ghost = null; q.inv = CFG.spawnInv; q.air = 0; }
+  }
+
+  // the elastic rope: slack up to its length, then a spring pulling both players together.
+  // Holding "reel" (down) shortens the rope so the partner is hauled in.
+  const reel = !!(inputs[0].reel || inputs[1].reel);
+  sim.reeling = reel;
+  if (reel) sim.ropeEff = Math.max(CFG.reelMin, sim.ropeEff - CFG.reelRate * dt);
+  else sim.ropeEff = Math.min(CFG.ropeLen, sim.ropeEff + CFG.reelRelease * dt);
+  sim.stretch = 0;
+  if (!sim.noRope && !p[0].ghost && !p[1].ghost) {
+    const a = p[0], b = p[1];
+    const dx = (b.x + b.w / 2) - (a.x + a.w / 2), dy = (b.y + b.h / 2) - (a.y + a.h / 2);
+    const dist = Math.hypot(dx, dy);
+    if (dist > 0.001) {
+      const nx = dx / dist, ny = dy / dist;
+      const rv = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+      let acc = 0;
+      if (dist > CFG.ropeLen) acc = Math.min(CFG.ropeMaxAcc, CFG.ropeK * (dist - CFG.ropeLen)) + CFG.ropeDamp * rv;
+      let wx = nx, wy = ny, wacc = 0, lift = false;
+      if (reel && dist > CFG.reelMin) {
+        // winch: a steady pull that tapers off as the players meet
+        wacc = CFG.reelMaxAcc * Math.min(1, (dist - CFG.reelMin) / 8) + CFG.ropeDamp * rv * 0.5;
+        // a player hugging a wall gets lifted so the haul can finish over the ledge
+        const lower = b.y > a.y ? b : a, upper = lower === b ? a : b;
+        const toward = (upper.x + upper.w / 2) > (lower.x + lower.w / 2) ? 1 : -1;
+        if (lower.y - upper.y > -2 && wallBeside(lv, lower, toward)) {
+          let tx = (upper.x + upper.w / 2) - (lower.x + lower.w / 2);
+          let ty = (upper.y + upper.h / 2 - CFG.reelLift) - (lower.y + lower.h / 2);
+          const m = Math.hypot(tx, ty) || 1; tx /= m; ty /= m;
+          // direction as seen from a toward b
+          wx = lower === b ? -tx : tx; wy = lower === b ? -ty : ty; lift = true;
+        }
+      }
+      if (acc < 0) acc = 0;
+      if (wacc > acc) acc = wacc;
+      if (!lift) { wx = nx; wy = ny; }
+      a.vx += wx * acc * dt; a.vy += wy * acc * dt;
+      b.vx -= wx * acc * dt; b.vy -= wy * acc * dt;
+      // a hard enough yank rips a standing player off the ground so they get dragged
+      if (!reel && acc > CFG.dislodgeAcc) {
+        for (const q of [a, b]) {
+          if (q.onGround && Math.abs(q.vx) > 40) {
+            q.vy = Math.min(q.vy, -CFG.dislodgePop); q.onGround = false; q.support = -1; q.coyote = 0;
+            sim.events.push({ type: 'tug', i: q.i, x: q.x + q.w / 2, y: q.y + q.h });
+          }
+        }
+      }
+      sim.stretch = Math.max(0, dist - CFG.ropeLen);
+    }
+  }
+
+  // input, friction, gravity, jump
+  for (let i = 0; i < 2; i++) {
+    const q = p[i]; if (q.ghost) continue;
+    const inp = inputs[i], dir = inp.dir;
+    if (dir) q.face = dir;
+    q.coyote = q.onGround ? CFG.coyote : Math.max(0, q.coyote - dt);
+    q.buffer = Math.max(0, q.buffer - dt);
+    if (q.inv > 0) q.inv -= dt;
+
+    const acc = q.onGround ? CFG.runAccel : CFG.airAccel;
+    if (dir > 0) {
+      if (q.vx < CFG.runMax) q.vx = Math.min(CFG.runMax, q.vx + acc * (q.vx < 0 ? CFG.brake : 1) * dt);
+    } else if (dir < 0) {
+      if (q.vx > -CFG.runMax) q.vx = Math.max(-CFG.runMax, q.vx - acc * (q.vx > 0 ? CFG.brake : 1) * dt);
+    } else {
+      const grip = (sim.stretch > 0 && !sim.reeling) ? CFG.tautFriction : CFG.friction;   // a taut rope loosens the ground's grip
+      const f = (q.onGround ? grip : CFG.airDrag) * dt;
+      if (q.vx > 0) q.vx = Math.max(0, q.vx - f); else q.vx = Math.min(0, q.vx + f);
+    }
+
+    q.vy = Math.min(CFG.maxFall, q.vy + CFG.gravity * dt);
+
+  }
+
+  // jumps. The player underneath goes first, so a rider can borrow their upward push.
+  for (const pass of [0, 1]) {
+    for (let i = 0; i < 2; i++) {
+      const q = p[i]; if (q.ghost) continue;
+      const riding = q.support >= 0 && !p[q.support].ghost;
+      if ((pass === 0) === riding) continue;
+      if (q.buffer > 0 && q.coyote > 0) {
+        const o = p[1 - i];
+        let v = CFG.jumpV;
+        if (riding && o.vy < 0) v += o.vy * CFG.stackBoost;          // jump off a rising partner: higher
+        q.vy = v; q.buffer = 0; q.coyote = 0; q.onGround = false; q.support = -1; q.jumping = true;
+        sim.events.push({ type: 'jump', i, x: q.x + q.w / 2, y: q.y + q.h });
+        // toss: if the rider is holding jump when the player below launches, they get flung up too
+        if (!riding && !o.ghost && o.support === i && inputs[1 - i].held) {
+          o.vy = Math.min(o.vy, CFG.jumpV * (1 + CFG.stackBoost)); o.onGround = false; o.support = -1; o.coyote = 0; o.jumping = true;
+        }
+      }
+    }
+  }
+  for (let i = 0; i < 2; i++) {
+    const q = p[i]; if (q.ghost) continue;
+    if (q.vy >= 0 || q.onGround) q.jumping = false;
+    if (q.jumping && !inputs[i].held && q.vy < CFG.jumpCut) q.vy = CFG.jumpCut;
+  }
+
+  // move + collide
+  const prevY = [p[0].y, p[1].y];
+  for (let i = 0; i < 2; i++) {
+    const q = p[i]; if (q.ghost) continue;
+    const o = p[1 - i];
+    let carry = 0;
+    if (q.support >= 0 && !o.ghost) carry = prevDx[1 - i] || 0;
+    const x0 = q.x;
+    moveX(lv, q, q.vx * dt + carry);
+    moveY(lv, q, q.vy * dt);
+    // landing on the other player's head
+    if (!q.onGround && q.vy >= 0 && !o.ghost) {
+      if (q.x + q.w > o.x + 1.5 && q.x < o.x + o.w - 1.5) {
+        const prevBottom = prevY[i] + q.h;
+        if (prevBottom <= o.y + 3 && q.y + q.h >= o.y) {
+          q.y = o.y - q.h; q.vy = Math.min(0, o.vy); q.onGround = true; q.support = 1 - i;
+        }
+      }
+    }
+    q.dx = q.x - x0;
+    if (q.onGround) q.air = 0; else q.air += dt;
+  }
+
+  // cannons fire bullets that fly straight; touch one and you're out, land on top of one to squash it
+  const dead = [];
+  if (!sim.noCannons && lv.cannons.length) {
+    const midX = (p[0].x + p[1].x) / 2, cc = lv.cannonCfg;
+    lv.cannons.forEach((c, i) => {
+      sim.cannonT[i] -= dt;
+      if (sim.cannonT[i] <= 0) {
+        sim.cannonT[i] += cc.period;
+        if (Math.abs(c.cx - midX) < 300) {
+          sim.bullets.push({ x: c.cx + c.dir * 10, y: c.cy, vx: c.dir * cc.speed, dir: c.dir, w: 12, h: 8 });
+          sim.events.push({ type: 'shoot', x: c.cx + c.dir * 14, y: c.cy, dir: c.dir });
+        }
+      }
+    });
+    for (let k = sim.bullets.length - 1; k >= 0; k--) {
+      const bl = sim.bullets[k];
+      bl.x += bl.vx * dt;
+      if (solidAt(lv, Math.floor((bl.x + bl.dir * 6) / TILE), Math.floor(bl.y / TILE))) {
+        sim.events.push({ type: 'boom', x: bl.x, y: bl.y }); sim.bullets.splice(k, 1); continue;
+      }
+      for (let i = 0; i < 2; i++) {
+        const q = p[i]; if (q.ghost) continue;
+        if (Math.abs(q.x + q.w / 2 - bl.x) < (q.w + bl.w) / 2 - 1 && Math.abs(q.y + q.h / 2 - bl.y) < (q.h + bl.h) / 2 - 1) {
+          if (q.vy > 20 && (q.y + q.h) - (bl.y - bl.h / 2) < 7) {
+            q.vy = -230; q.onGround = false; q.support = -1; q.air = 0;
+            sim.events.push({ type: 'stomp', x: bl.x, y: bl.y - 4 }); sim.bullets.splice(k, 1);
+          } else if (dead.indexOf(i) < 0) dead.push(i);
+          break;
+        }
+      }
+    }
+  }
+
+  // the chaser: a monster that closes in from the right, or goo that rises from below
+  const ch = sim.chaser;
+  if (ch && !sim.noChasers) {
+    if (sim.started) { if (ch.delay > 0) ch.delay -= dt; else if (ch.pause > 0) ch.pause -= dt; else ch.pos -= ch.speed * dt; }
+    for (let i = 0; i < 2; i++) {
+      const q = p[i]; if (q.ghost || dead.indexOf(i) >= 0) continue;
+      if (ch.kind === 'up' ? (q.y + q.h > ch.pos + 3) : (q.x + q.w > ch.pos)) dead.push(i);
+    }
+  }
+
+  // hazards
+  for (let i = 0; i < 2; i++) {
+    const q = p[i]; if (q.ghost || dead.indexOf(i) >= 0) continue;
+    if (q.y + q.h > lv.deathY + 6) q.low += dt; else q.low = 0;   // below the floor: a 3-second countdown (a haul back up cancels it)
+    if (q.y > CFG.killY || q.low >= CFG.lowTime || touchesSpike(lv, q) || q.air > CFG.hangLimit) dead.push(i);
+  }
+  if (dead.length) killPlayers(sim, dead);
+
+  // pickups, checkpoints
+  for (let i = 0; i < 2; i++) {
+    const q = p[i]; if (q.ghost) continue;
+    for (const s of sim.stars) {
+      if (s.got) continue;
+      if (Math.abs(q.x + q.w / 2 - s.x) < 9 && Math.abs(q.y + q.h / 2 - s.y) < 9) {
+        s.got = true; sim.starCount++; sim.events.push({ type: 'star', x: s.x, y: s.y });
+      }
+    }
+    for (const cp of lv.checkpoints) {
+      if (cp.tx <= sim.cp.tx) continue;
+      if (Math.abs(q.x + q.w / 2 - cp.cx) < 12 && q.y + q.h > cp.floorY - 28 && q.y < cp.floorY) {
+        sim.cp = cp; sim.events.push({ type: 'checkpoint', x: cp.cx, y: cp.floorY });
+      }
+    }
+  }
+
+  // exit: both players inside
+  const ex = lv.exit;
+  const inside = q => !q.ghost && q.x + q.w / 2 > ex.x && q.x + q.w / 2 < ex.x + ex.w && q.y + q.h / 2 > ex.y && q.y + q.h / 2 < ex.y + ex.h + 4;
+  const n = (inside(p[0]) ? 1 : 0) + (inside(p[1]) ? 1 : 0);
+  sim.inExit = n;
+  if (n === 2) sim.exitTimer += dt; else sim.exitTimer = Math.max(0, sim.exitTimer - dt * 2);
+  if (sim.exitTimer >= CFG.exitHold) { sim.done = true; sim.events.push({ type: 'win' }); }
+}
+
+if (typeof module !== 'undefined') {
+  module.exports = { recallToCheckpoint, T_CANNON, TILE, VW, VH, ROWS, CFG, parseLevel, createSim, step, pressJump, solidAt, placeAtCheckpoint, makePlayer, moveX, moveY, touchesSpike };
+}
+
+
+/* ================= LEVELS =================
+   # = ground   ^ = spikes   S = start   E = exit   C = checkpoint   * = star
+   Each map is 17 rows tall. Edit these rows to make your own levels! */
+const LEVEL_DEFS = [
+ {
+  "name": "FIRST STEPS",
+  "theme": 0,
+  "hint": [
+   "DOT: W A D + S TO REEL   SQUARE: ARROW KEYS",
+   "STAY CLOSE, THE ROPE PULLS YOU BACK!"
+  ],
+  "rows": [
+   "........................................................................",
+   "........................................................................",
+   "........................................................................",
+   "........................................................................",
+   "........................................................................",
+   "........................................................................",
+   "........................................................................",
+   "........................................................................",
+   "....................................*...................................",
+   "...............*........................................................",
+   "...................................###.........*........................",
+   "..............##................##......................................",
+   "...S.....#....##..............C.##................................E.....",
+   "########################...###################...#######################",
+   "########################...###################...#######################",
+   "########################...###################...#######################",
+   "########################...###################...#######################"
+  ]
+ },
+ {
+  "name": "STONE HOP",
+  "theme": 1,
+  "hint": [
+   "BIG GAPS: JUMP AT THE SAME TIME!",
+   "FALL IN AND YOUR PARTNER GETS YANKED TO THE FLAG"
+  ],
+  "rows": [
+   ".............................................................................................",
+   ".............................................................................................",
+   ".............................................................................................",
+   ".............................................................................................",
+   ".............................................................................................",
+   ".............................................................................................",
+   ".............................................................................................",
+   ".............................................................................................",
+   "........................................................................*....................",
+   ".............*...............................................................................",
+   "..................................................*..........C.........###..............E....",
+   ".............................###......C.....................###...###........################",
+   "...S........###...###...###........###########...###...###...................################",
+   "##########.........................###########...............................################",
+   "##########.........................###########...............................################",
+   "##########.........................###########...............................################",
+   "##########.........................###########...............................################"
+  ]
+ },
+ {
+  "name": "BOOST UP",
+  "theme": 2,
+  "hint": [
+   "TOO TALL TO JUMP? STAND ON YOUR PARTNER!",
+   "JUMP TOGETHER FOR EXTRA HEIGHT, OR HOLD DOWN TO REEL."
+  ],
+  "rows": [
+   "............................................................................",
+   "............................................................................",
+   "............................................................................",
+   "............................................................................",
+   "............................................................................",
+   "............................................................................",
+   "............................................................................",
+   "..................................*.........................................",
+   "...................*...........................*............................",
+   "................................###.........................................",
+   "..................##..........#####...........##............................",
+   "..................##..........#####...........##............................",
+   "...S..............##....C.....#####...C.......##........................E...",
+   "#########################################...################################",
+   "#########################################...################################",
+   "#########################################...################################",
+   "#########################################...################################"
+  ]
+ },
+ {
+  "name": "SPIKE ALLEY",
+  "theme": 3,
+  "hint": [
+   "SPIKES! A TUG FROM YOUR PARTNER CAN PULL YOU IN.",
+   "LAND FIRST, THEN BRING THEM ACROSS."
+  ],
+  "rows": [
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "...........................................................*........................",
+   ".....................................*..............................................",
+   "..........................................................##........*...............",
+   "....................................##...##...##..........##........................",
+   "...S........^^.....^^.....^^...C..^^##^^^##^^^##^^..C.....##^^....^^..^^.......E....",
+   "####################################################################################",
+   "####################################################################################",
+   "####################################################################################",
+   "####################################################################################"
+  ]
+ },
+ {
+  "name": "THE CLIMB",
+  "theme": 4,
+  "hint": [
+   "CLIMB TOGETHER. BOOST, THEN REEL.",
+   "FALL IN A PIT AND YOU RESPAWN AT THE LAST FLAG."
+  ],
+  "rows": [
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   "....................................................................................",
+   ".......................*.....C......................................................",
+   "..........................#######...................................................",
+   "......................##..............*.............................................",
+   "......................##............................................................",
+   "...............*......##............#####..........................E................",
+   "..................#######......................................########.............",
+   "..............##............................................##......................",
+   "..............##............................................##......................",
+   "...S..........##..................................C.........##......................",
+   "###################################..........#######################################",
+   "###################################..........#######################################",
+   "###################################..........#######################################"
+  ]
+ },
+ {
+  "name": "GAUNTLET",
+  "theme": 5,
+  "hint": [
+   "EVERYTHING YOU LEARNED, ALL AT ONCE.",
+   "GOOD LUCK!"
+  ],
+  "rows": [
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "......................................................................................*.............",
+   "....................................................................................................",
+   ".....................................*....................................................E.........",
+   "............................................................*.....................############......",
+   "....................................##........................................##....................",
+   "........................C...........##.................##...##................##....................",
+   ".......................##...........##.^^..C.........^^##^^^##^^..C...........##....................",
+   "...S..........##...##.......##################...####...........##################..................",
+   "############................##################...####...........##################..................",
+   "############................##################...####...........##################..................",
+   "############................##################...####...........##################..................",
+   "############................##################...####...........##################.................."
+  ]
+ },
+ {
+  "name": "CANNON RUN",
+  "theme": 6,
+  "hint": [
+   "CANNONS! JUMP THE BULLETS, OR LAND ON THEM.",
+   "JUMP TOGETHER OR THE ROPE YANKS YOU INTO ONE."
+  ],
+  "cannon": {
+   "period": 3,
+   "speed": 75
+  },
+  "rows": [
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   "....................................................................................................",
+   ".......................................*....................*...................*...................",
+   "....................................................................................................",
+   "................................................................................C................<..",
+   "...S..................................<...........>.C...............<....###...###...###.....E...#..",
+   "############################################...########################....................#########",
+   "############################################...########################....................#########",
+   "############################################...########################....................#########",
+   "############################################...########################....................#########"
+  ]
+ },
+ {
+  "name": "THE CHASE",
+  "theme": 4,
+  "hint": [
+   "IT'S COMING! KEEP RUNNING LEFT!",
+   "IT SPEEDS UP IF YOU WAIT, SO DON'T WAIT."
+  ],
+  "chaser": {
+   "kind": "left",
+   "speed": 54,
+   "delay": 2.5,
+   "lead": 420
+  },
+  "rows": [
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..............................................................................................................",
+   "..................................................................*...........................................",
+   ".......................................*............................................*.........................",
+   "...........................##.....................................##..........................................",
+   "....E.........C............##....C....###...###....^^.............##....C...........#....C................S...",
+   "################...################..............#######...###############...##############...################",
+   "################...################..............#######...###############...##############...################",
+   "################...################..............#######...###############...##############...################",
+   "################...################..............#######...###############...##############...################"
+  ]
+ },
+ {
+  "name": "THE DEEP",
+  "theme": 7,
+  "hint": [
+   "SOMETHING IS RISING! CLIMB, CLIMB, CLIMB!",
+   "JUMP TOGETHER FROM A STACK TO GET UP FAST."
+  ],
+  "chaser": {
+   "kind": "up",
+   "speed": 5,
+   "delay": 5,
+   "startY": 268
+  },
+  "rows": [
+   "........................................",
+   "........................................",
+   "........................................",
+   "...................................E....",
+   "........................*.....#########.",
+   "..........................##............",
+   "...................*......##............",
+   "........................C.##............",
+   ".......................#####............",
+   "..............*....C....................",
+   "..................###...................",
+   "..............C.........................",
+   ".............###........................",
+   "...S....................................",
+   "###########.............................",
+   "###########.............................",
+   "###########............................."
+  ]
+ }
+];
+
+
+/* ================= GAME LAYER: input, drawing, menus ================= */
+
+// ---- settings you can change ----
+const KEYMAP = {
+  dot:    { left: 'KeyA',      right: 'KeyD',       jump: 'KeyW',    reel: 'KeyS' },
+  square: { left: 'ArrowLeft', right: 'ArrowRight', jump: 'ArrowUp', reel: 'ArrowDown' }
+};
+const UNLOCK_ALL = true;           // false = beat a level to unlock the next one
+const SAVE_KEY = 'tethered.v1';
+const STEP = 1 / 120;
+
+// ---- palette (DawnBringer-16 style) ----
+const C = {
+  ink: '#140c1c', plum: '#442434', navy: '#30346d', slate: '#4e4a4e', brown: '#854c30',
+  forest: '#346524', red: '#d04648', stone: '#757161', blue: '#597dce', orange: '#d27d2c',
+  steel: '#8595a1', skin: '#d2aa99', grass: '#6daa2c', aqua: '#6dc2ca', yellow: '#dad45e', cream: '#deeed6'
+};
+
+const THEMES = [
+  { sky: [C.blue, '#6d9fd0', C.aqua], far: '#5aa5b0', near: '#4f9a52', top: C.grass, topHi: '#8fcf4a', body: C.brown, speck: '#6b3b26', fx: 'clouds', cloud: C.cream },
+  { sky: ['#30346d', '#7a3a58', C.orange], far: '#6a3050', near: '#442434', top: C.orange, topHi: '#e8a050', body: '#6b3b26', speck: C.plum, fx: 'clouds', cloud: '#a8586a' },
+  { sky: [C.ink, '#241630'], far: '#2e1c3a', near: '#3a2446', top: C.steel, topHi: C.cream, body: C.slate, speck: C.ink, fx: 'stalactites', cloud: C.cream },
+  { sky: [C.ink, '#1b1a45', C.navy], far: '#262860', near: '#1d1f4d', top: C.forest, topHi: C.grass, body: C.plum, speck: C.ink, fx: 'stars', cloud: C.cream },
+  { sky: ['#2a1020', '#6a2a3a', '#a8403e'], far: '#4a1a2c', near: '#3a1426', top: C.orange, topHi: C.yellow, body: '#5a2a2a', speck: '#3a1414', fx: 'embers', cloud: C.cream },
+  { sky: [C.aqua, '#b0dcd8', C.cream], far: '#8fc8d0', near: '#a8d4dc', top: C.cream, topHi: '#ffffff', body: C.steel, speck: C.blue, fx: 'snow', cloud: C.cream },
+  { sky: ['#1a1020', '#3a2040', '#7a3040'], far: '#2a1830', near: '#201026', top: C.stone, topHi: C.skin, body: C.slate, speck: C.ink, fx: 'embers', cloud: C.cream },
+  { sky: [C.ink, '#0e2a2e', '#134a48'], far: '#0e2a2e', near: '#0a1f24', top: C.aqua, topHi: C.cream, body: '#1d4a4a', speck: C.ink, fx: 'bubbles', cloud: C.cream }
+];
+
+// ---- canvas ----
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+cv.width = VW; cv.height = VH;
+ctx.imageSmoothingEnabled = false;
+
+function fit() {
+  const s0 = Math.min(window.innerWidth / VW, window.innerHeight / VH);
+  let s = s0 >= 1 ? Math.floor(s0) : s0;
+  if (s0 >= 1 && s0 - s > 0.8) s = s0;      // nearly an integer: use the whole window
+  cv.style.width = Math.floor(VW * s) + 'px';
+  cv.style.height = Math.floor(VH * s) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+// ---- small helpers ----
+function rect(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), w, h); }
+function txt(s, x, y, o) {
+  o = o || {};
+  const size = o.size || 8;
+  ctx.font = size + 'px "Press Start 2P", monospace';
+  ctx.textBaseline = 'top'; ctx.textAlign = o.align || 'left';
+  if (o.shadow !== false) { ctx.fillStyle = o.shadowColor || C.ink; const so = size >= 16 ? 2 : 1; ctx.fillText(s, Math.round(x) + so, Math.round(y) + so); }
+  ctx.fillStyle = o.color || C.cream; ctx.fillText(s, Math.round(x), Math.round(y));
+}
+function hash(a, b) { let h = (a * 374761393 + b * 668265263) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; }
+function fmtTime(t) { const m = Math.floor(t / 60), s = t - m * 60; return String(m).padStart(2, '0') + ':' + (s < 10 ? '0' : '') + s.toFixed(1); }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+// ---- save data ----
+let save = { levels: {} };
+try { const raw = localStorage.getItem(SAVE_KEY); if (raw) save = JSON.parse(raw) || save; } catch (e) { /* storage blocked: progress won't persist */ }
+function writeSave() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) { } }
+
+// ---- sound (tiny chiptune beeps) ----
+let actx = null, muted = false;
+function audioInit() { if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { actx = null; } } if (actx && actx.state === 'suspended') actx.resume(); }
+function tone(f0, f1, dur, type, vol, delay) {
+  if (!actx || muted) return;
+  const t = actx.currentTime + (delay || 0);
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  g.gain.setValueAtTime(vol || 0.05, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t + dur + 0.02);
+}
+const SFX = {
+  jump0: () => tone(300, 620, 0.11, 'square', 0.045),
+  jump1: () => tone(190, 400, 0.12, 'triangle', 0.09),
+  star: () => { tone(880, 880, 0.07, 'square', 0.045); tone(1320, 1320, 0.12, 'square', 0.045, 0.07); },
+  flag: () => { [523, 659, 784].forEach((f, i) => tone(f, f, 0.1, 'square', 0.04, i * 0.08)); },
+  die: () => tone(380, 50, 0.4, 'sawtooth', 0.06),
+  yank: () => tone(90, 520, 0.32, 'triangle', 0.1),
+  tick: () => tone(140, 110, 0.03, 'square', 0.03),
+  tug: () => tone(260, 70, 0.14, 'sawtooth', 0.05),
+  shoot: () => { tone(110, 40, 0.22, 'sawtooth', 0.07); tone(500, 120, 0.1, 'square', 0.03); },
+  stomp: () => { tone(330, 660, 0.08, 'square', 0.05); tone(660, 990, 0.08, 'square', 0.04, 0.06); },
+  boom: () => tone(120, 40, 0.12, 'square', 0.04),
+  win: () => { [523, 659, 784, 1047, 784, 1047].forEach((f, i) => tone(f, f, 0.14, 'square', 0.05, i * 0.1)); },
+  menu: () => tone(660, 660, 0.04, 'square', 0.035),
+  pick: () => { tone(440, 440, 0.06, 'square', 0.04); tone(660, 660, 0.1, 'square', 0.04, 0.06); }
+};
+
+// ---- sprites ----
+function makeSprite(fn) { const c = document.createElement('canvas'); c.width = 12; c.height = 12; fn(c.getContext('2d')); return c; }
+function eyes(g, face) { g.fillStyle = C.ink; const xs = face > 0 ? [6, 9] : [2, 5]; xs.forEach(x => g.fillRect(x, 4, 1, 2)); }
+function dotSprite(face) {
+  return makeSprite(g => {
+    for (let y = 0; y < 12; y++) for (let x = 0; x < 12; x++) {
+      const d = Math.hypot(x - 5.5, y - 5.5);
+      if (d <= 6.0) {
+        let col = C.ink;
+        if (d <= 5.0) col = (y >= 8) ? '#b4a83c' : C.yellow;
+        if (d <= 4.0 && x >= 2 && x <= 4 && y >= 2 && y <= 3) col = C.cream;
+        g.fillStyle = col; g.fillRect(x, y, 1, 1);
+      }
+    }
+    eyes(g, face);
+  });
+}
+function squareSprite(face) {
+  return makeSprite(g => {
+    g.fillStyle = C.ink; g.fillRect(0, 0, 12, 12);
+    g.fillStyle = C.red; g.fillRect(1, 1, 10, 10);
+    g.fillStyle = '#a02e3a'; g.fillRect(1, 9, 10, 2);
+    g.fillStyle = '#f08080'; g.fillRect(2, 2, 3, 1); g.fillRect(2, 3, 1, 2);
+    eyes(g, face);
+  });
+}
+const SPR = { dot: [dotSprite(-1), dotSprite(1)], square: [squareSprite(-1), squareSprite(1)] };
+const STAR_PAT = ['...##...', '...##...', '########', '.######.', '..####..', '..####..', '.##..##.', '.#....#.'];
+function drawStarPat(x, y, col, hi, s, outline) {
+  s = s || 1;
+  if (outline) { const k = s; [[-k, 0], [k, 0], [0, -k], [0, k]].forEach(o => { for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) if (STAR_PAT[r][c] === '#') { ctx.fillStyle = C.ink; ctx.fillRect(x + c * s + o[0], y + r * s + o[1], s, s); } }); }
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) if (STAR_PAT[r][c] === '#') { ctx.fillStyle = (hi && r < 3 && c < 5) ? hi : col; ctx.fillRect(x + c * s, y + r * s, s, s); }
+}
+
+// ---- levels ----
+const LEVELS = LEVEL_DEFS.map(parseLevel);
+const tileCache = {};
+function tilesFor(i) {
+  if (tileCache[i]) return tileCache[i];
+  const lv = LEVELS[i], th = THEMES[lv.theme];
+  const c = document.createElement('canvas'); c.width = lv.pixelW; c.height = VH;
+  const g = c.getContext('2d');
+  const solid = (tx, ty) => (tx < 0 || tx >= lv.w || ty >= lv.h) ? true : (ty < 0 ? false : (lv.grid[ty][tx] === T_SOLID || lv.grid[ty][tx] === T_CANNON));
+  for (let ty = 0; ty < lv.h; ty++) for (let tx = 0; tx < lv.w; tx++) {
+    const t = lv.grid[ty][tx], x = tx * TILE, y = ty * TILE;
+    if (t === T_CANNON) {
+      const cn = lv.cannons.find(c => c.tx === tx && c.ty === ty), d = cn ? cn.dir : -1;
+      g.fillStyle = C.ink; g.fillRect(x, y, 16, 16);
+      g.fillStyle = '#34323e'; g.fillRect(x + 1, y + 1, 14, 14);
+      g.fillStyle = C.steel; g.fillRect(x + 1, y + 3, 14, 1); g.fillRect(x + 1, y + 12, 14, 1);
+      g.fillStyle = C.cream; g.fillRect(x + (d > 0 ? 2 : 12), y + 1, 1, 1); g.fillRect(x + (d > 0 ? 2 : 12), y + 14, 1, 1);
+      const mx = d > 0 ? x + 9 : x + 1;
+      g.fillStyle = C.steel; g.fillRect(mx - (d > 0 ? 1 : 0), y + 3, 7, 10);
+      g.fillStyle = C.ink; g.fillRect(mx + (d > 0 ? 0 : 1), y + 4, 5, 8);
+      g.fillStyle = C.red; g.fillRect(mx + (d > 0 ? 1 : 2), y + 6, 2, 4);
+    } else if (t === T_SOLID) {
+      const up = !solid(tx, ty - 1), dn = !solid(tx, ty + 1), lf = !solid(tx - 1, ty), rt = !solid(tx + 1, ty);
+      g.fillStyle = th.body; g.fillRect(x, y, 16, 16);
+      for (let k = 0; k < 3; k++) { const sx = Math.floor(hash(tx * 7 + k, ty) * 13) + 1, sy = Math.floor(hash(tx, ty * 5 + k) * 11) + 5; g.fillStyle = th.speck; g.fillRect(x + sx, y + sy, 2, 2); }
+      if (up) {
+        g.fillStyle = th.top; g.fillRect(x, y + 1, 16, 4);
+        g.fillStyle = th.topHi; g.fillRect(x, y + 1, 16, 1);
+        for (let k = 0; k < 8; k++) { const dd = hash(tx * 3 + k, ty + 9); if (dd > 0.45) { g.fillStyle = th.top; g.fillRect(x + k * 2, y + 5, 2, dd > 0.8 ? 3 : 1); } }
+        g.fillStyle = C.ink; g.fillRect(x, y, 16, 1);
+      }
+      g.fillStyle = C.ink;
+      if (lf) g.fillRect(x, y, 1, 16);
+      if (rt) g.fillRect(x + 15, y, 1, 16);
+      if (dn) g.fillRect(x, y + 15, 16, 1);
+    } else if (t === T_SPIKE) {
+      for (let s = 0; s < 2; s++) {
+        const bx = x + s * 8;
+        for (let r = 0; r < 8; r++) {
+          const w = 2 * (Math.floor(r / 2) + 1), ox = bx + 4 - w / 2;
+          g.fillStyle = C.steel; g.fillRect(ox, y + 8 + r, w, 1);
+          g.fillStyle = C.cream; g.fillRect(ox, y + 8 + r, 1, 1);
+          g.fillStyle = C.slate; g.fillRect(ox + w - 1, y + 8 + r, 1, 1);
+        }
+      }
+    }
+  }
+  return (tileCache[i] = c);
+}
+
+const bgCache = {};
+function bgFor(ti) {
+  if (bgCache[ti]) return bgCache[ti];
+  const th = THEMES[ti], c = document.createElement('canvas'); c.width = VW; c.height = VH;
+  const g = c.getContext('2d'), n = th.sky.length;
+  for (let i = 0; i < n; i++) { g.fillStyle = th.sky[i]; g.fillRect(0, Math.floor(i * VH / n), VW, Math.ceil(VH / n) + 1); }
+  for (let i = 1; i < n; i++) {
+    const y0 = Math.floor(i * VH / n);
+    for (let r = 0; r < 4; r++) for (let x = 0; x < VW; x += 2) {
+      if (((x >> 1) + r) % 2 === 0) { g.fillStyle = r < 2 ? th.sky[i] : th.sky[i - 1]; g.fillRect(x, y0 - 2 + r, 2, 1); }
+    }
+  }
+  return (bgCache[ti] = c);
+}
+function hillH(x, seed, amp) { return Math.floor((Math.sin(x * 0.013 + seed) * 0.5 + Math.sin(x * 0.031 + seed * 2.1) * 0.3 + 1) * amp / 4) * 4; }
+
+function drawBackground(ti, camX, t) {
+  const th = THEMES[ti];
+  ctx.drawImage(bgFor(ti), 0, 0);
+  if (th.fx === 'stars') {
+    rect(380 - camX * 0.04, 34, 12, 12, C.cream); rect(384 - camX * 0.04, 38, 8, 8, '#c0cce0');
+    for (let i = 0; i < 70; i++) {
+      const x = ((i * 97) % 520) - camX * 0.08, y = (i * 53) % 150;
+      const xx = ((x % 520) + 520) % 520; if (xx > VW) continue;
+      if ((Math.floor(t * 2) + i) % 5 !== 0) rect(xx, y, i % 7 === 0 ? 2 : 1, i % 7 === 0 ? 2 : 1, C.cream);
+    }
+  }
+  if (th.fx === 'clouds') {
+    for (let i = 0; i < 9; i++) {
+      const x = ((((i * 211) % 900) - camX * 0.18 - t * 3) % 900 + 900) % 900 - 60, y = 18 + (i * 37) % 70;
+      if (x > VW) continue;
+      rect(x + 6, y, 28, 6, th.cloud); rect(x, y + 6, 46, 6, th.cloud); rect(x + 12, y - 5, 16, 6, th.cloud);
+    }
+  }
+  if (th.fx !== 'stalactites') {
+    ctx.fillStyle = th.far;
+    for (let x = 0; x < VW; x += 4) { const h = 44 + hillH(x + camX * 0.25, 1.3, 56); ctx.fillRect(x, VH - h, 4, h); }
+  } else {
+    ctx.fillStyle = th.far;
+    for (let x = 0; x < VW; x += 4) { const h = 4 + hillH(x + camX * 0.35, 4.1, 30); ctx.fillRect(x, 0, 4, h); }
+  }
+  ctx.fillStyle = th.near;
+  if (th.fx !== 'stalactites') { for (let x = 0; x < VW; x += 4) { const h = 28 + hillH(x + camX * 0.5, 5.7, 36); ctx.fillRect(x, VH - h, 4, h); } }
+  else { for (let x = 0; x < VW; x += 4) { const h = 2 + hillH(x + camX * 0.6, 8.2, 14); ctx.fillRect(x, 0, 4, h); } }
+  if (th.fx === 'embers') {
+    for (let i = 0; i < 28; i++) { const x = ((i * 61) + Math.sin(t + i) * 8 - camX * 0.3) % VW, y = VH - ((t * 22 + i * 37) % VH); rect(((x % VW) + VW) % VW, y, 2, 2, i % 3 ? C.orange : C.yellow); }
+  }
+  if (th.fx === 'bubbles') {
+    for (let i = 0; i < 30; i++) { const x = ((i * 53) + Math.sin(t + i) * 6 - camX * 0.3) % VW, y = VH - ((t * 16 + i * 41) % VH); rect(((x % VW) + VW) % VW, y, 2, 2, i % 3 ? C.aqua : C.cream); }
+  }
+  if (th.fx === 'snow') {
+    for (let i = 0; i < 40; i++) { const x = ((i * 43) + Math.sin(t * 0.8 + i) * 8 - camX * 0.3) % VW, y = (t * 24 + i * 29) % VH; rect(((x % VW) + VW) % VW, y, i % 4 ? 1 : 2, i % 4 ? 1 : 2, '#ffffff'); }
+  }
+}
+
+// ---- particles ----
+let parts = [];
+function puff(x, y, n, col, spd, grav, life, size) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = (0.3 + Math.random() * 0.7) * spd;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - spd * 0.2, g: grav, life: life * (0.6 + Math.random() * 0.4), max: life, col, size: size || 2 });
+  }
+}
+function updateParts(dt) {
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+}
+function drawParts(camX) {
+  for (const p of parts) { ctx.globalAlpha = Math.min(1, p.life / (p.max * 0.5)); rect(p.x - camX, p.y, p.size, p.size, p.col); }
+  ctx.globalAlpha = 1;
+}
+
+// ---- rope drawing (beads) ----
+function drawRope(x1, y1, x2, y2, restLen, stretch, reeling, t) {
+  const dx = x2 - x1, dy = y2 - y1, d = Math.hypot(dx, dy) || 1;
+  let sag = 0; if (d < restLen) sag = Math.min(6, Math.sqrt((restLen - d) * 3 * d / 8));
+  const n = Math.max(2, Math.ceil(d / 2.5)), nx = -dy / d, ny = dx / d;
+  const wob = stretch > 3 ? Math.min(1.6, stretch * 0.07) : 0;
+  let a = C.skin, b = '#a8785a';
+  if (stretch > 16) { a = C.red; b = '#8a2a30'; } else if (stretch > 4) { a = C.orange; b = '#b0601c'; }
+  if (reeling) { a = Math.floor(t * 12) % 2 ? C.yellow : C.cream; b = C.orange; }
+  const pts = [];
+  for (let i = 0; i <= n; i++) {
+    const u = i / n; let px = x1 + dx * u, py = y1 + dy * u + sag * 4 * u * (1 - u);
+    if (wob) { const w = Math.sin(t * 50 + u * 14) * wob * Math.sin(Math.PI * u); px += nx * w; py += ny * w; }
+    pts.push([Math.round(px), Math.round(py)]);
+  }
+  ctx.fillStyle = C.ink; pts.forEach(p => ctx.fillRect(p[0] - 2, p[1] - 1, 4, 4));
+  pts.forEach((p, i) => { ctx.fillStyle = i % 2 ? a : b; ctx.fillRect(p[0] - 1, p[1], 2, 2); });
+}
+
+// ---- game state ----
+const G = { mode: 'menu', sel: 0, t: 0, li: 0, sim: null, cam: 0, shake: 0, hintT: 0, winT: 0, result: null, acc: 0, reelTick: 0, prev: [{}, {}], flash: 0 };
+const keys = new Set();
+
+function startLevel(i) {
+  G.li = i; G.sim = createSim(LEVELS[i]); G.mode = 'play'; G.hintT = 0; G.winT = 0; G.result = null; G.acc = 0; G.shake = 0;
+  parts = [];
+  const p = G.sim.p; G.cam = clamp((p[0].x + p[1].x) / 2 - VW / 2, 0, Math.max(0, LEVELS[i].pixelW - VW));
+  G.prev = [{ ground: true, vy: 0 }, { ground: true, vy: 0 }];
+  tilesFor(i);
+}
+function isUnlocked(i) { return UNLOCK_ALL || i === 0 || !!save.levels[i - 1]; }
+
+function readInputs() {
+  const d = KEYMAP.dot, s = KEYMAP.square;
+  return [
+    { dir: (keys.has(d.right) ? 1 : 0) - (keys.has(d.left) ? 1 : 0), held: keys.has(d.jump), reel: keys.has(d.reel) },
+    { dir: (keys.has(s.right) ? 1 : 0) - (keys.has(s.left) ? 1 : 0), held: keys.has(s.jump), reel: keys.has(s.reel) }
+  ];
+}
+
+// ---- input events ----
+const BLOCK = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space']);
+window.addEventListener('keydown', e => {
+  if (BLOCK.has(e.code)) e.preventDefault();
+  audioInit();
+  if (e.repeat) return;
+  keys.add(e.code);
+  if (e.code === 'KeyM') { muted = !muted; return; }
+  if (e.code === 'KeyF') { try { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen(); } catch (er) { } return; }
+  if (G.mode === 'menu') menuKey(e.code);
+  else if (G.mode === 'play' || G.mode === 'won') {
+    if (G.mode === 'play') {
+      if (e.code === KEYMAP.dot.jump) pressJump(G.sim, 0);
+      if (e.code === KEYMAP.square.jump) pressJump(G.sim, 1);
+    }
+    if (e.code === 'KeyR') startLevel(G.li);
+    if (e.code === 'KeyY' && G.mode === 'play') recallToCheckpoint(G.sim);
+    if (e.code === 'Escape') { G.mode = 'menu'; G.sel = G.li; }
+  } else if (G.mode === 'complete') {
+    if (e.code === 'Enter' || e.code === 'Space') { SFX.pick(); if (G.li + 1 < LEVELS.length) startLevel(G.li + 1); else { G.mode = 'menu'; G.sel = 0; } }
+    if (e.code === 'KeyR') startLevel(G.li);
+    if (e.code === 'Escape') { G.mode = 'menu'; G.sel = G.li; }
+  }
+});
+window.addEventListener('keyup', e => { keys.delete(e.code); });
+window.addEventListener('blur', () => keys.clear());
+
+const COLS = 4, CARD = { w: 106, h: 48, gx: 8, gy: 6, x0: 16, y0: 90 };
+function cardRect(i) { const c = i % COLS, r = Math.floor(i / COLS); return { x: CARD.x0 + c * (CARD.w + CARD.gx), y: CARD.y0 + r * (CARD.h + CARD.gy), w: CARD.w, h: CARD.h }; }
+function menuKey(code) {
+  const n = LEVELS.length;
+  if (code === 'ArrowRight' || code === 'KeyD') { G.sel = (G.sel + 1) % n; SFX.menu(); }
+  else if (code === 'ArrowLeft' || code === 'KeyA') { G.sel = (G.sel + n - 1) % n; SFX.menu(); }
+  else if (code === 'ArrowDown' || code === 'KeyS') { G.sel = (G.sel + COLS < n) ? G.sel + COLS : G.sel % COLS; SFX.menu(); }
+  else if (code === 'ArrowUp' || code === 'KeyW') { G.sel = (G.sel >= COLS) ? G.sel - COLS : ((G.sel + COLS < n) ? G.sel + COLS : G.sel); SFX.menu(); }
+  else if (code === 'Enter' || code === 'Space') { if (isUnlocked(G.sel)) { SFX.pick(); startLevel(G.sel); } }
+}
+cv.addEventListener('mousedown', e => {
+  audioInit();
+  if (G.mode !== 'menu') return;
+  const r = cv.getBoundingClientRect(), mx = (e.clientX - r.left) / r.width * VW, my = (e.clientY - r.top) / r.height * VH;
+  for (let i = 0; i < LEVELS.length; i++) { const c = cardRect(i); if (mx >= c.x && mx < c.x + c.w && my >= c.y && my < c.y + c.h) { G.sel = i; if (isUnlocked(i)) { SFX.pick(); startLevel(i); } } }
+});
+
+// ---- update ----
+function handleEvents(sim) {
+  for (const ev of sim.events) {
+    if (ev.type === 'jump') { (ev.i === 0 ? SFX.jump0 : SFX.jump1)(); puff(ev.x, ev.y, 4, C.cream, 40, 120, 0.3, 2); }
+    else if (ev.type === 'star') { SFX.star(); puff(ev.x, ev.y, 10, C.yellow, 70, 60, 0.5, 2); }
+    else if (ev.type === 'checkpoint') { SFX.flag(); puff(ev.x, ev.y - 16, 14, C.cream, 80, 100, 0.6, 2); }
+    else if (ev.type === 'die') { SFX.die(); G.shake = 0.25; puff(ev.x, ev.y, 18, ev.i === 0 ? C.yellow : C.red, 120, 200, 0.7, 3); }
+    else if (ev.type === 'yank') { SFX.yank(); }
+    else if (ev.type === 'recall') { puff(ev.x + 5, ev.y + 5, 8, C.aqua, 80, 0, 0.5, 2); if (!G.recallSfx || G.t - G.recallSfx > 0.1) { SFX.yank(); G.recallSfx = G.t; } }
+    else if (ev.type === 'tug') { SFX.tug(); G.shake = Math.max(G.shake, 0.07); puff(ev.x, ev.y, 6, C.cream, 60, 80, 0.3, 2); }
+    else if (ev.type === 'shoot') { SFX.shoot(); puff(ev.x, ev.y, 6, C.steel, 50, 0, 0.35, 3); }
+    else if (ev.type === 'stomp') { SFX.stomp(); puff(ev.x, ev.y, 10, C.orange, 90, 80, 0.4, 2); }
+    else if (ev.type === 'boom') { SFX.boom(); puff(ev.x, ev.y, 5, C.orange, 50, 40, 0.3, 2); }
+    else if (ev.type === 'win') { SFX.win(); }
+  }
+  sim.events.length = 0;
+}
+
+function update(dt) {
+  G.t += dt;
+  updateParts(dt);
+  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt);
+  if (G.mode !== 'play' && G.mode !== 'won' && G.mode !== 'complete') return;
+  const sim = G.sim, lv = LEVELS[G.li];
+
+  if (G.mode === 'play') {
+    G.hintT += dt;
+    G.acc += dt;
+    const inp = readInputs();
+    let n = 0;
+    while (G.acc >= STEP && n < 12) {
+      step(sim, STEP, inp); G.acc -= STEP; n++;
+      handleEvents(sim);
+      if (sim.done) break;
+    }
+    if (G.acc > STEP * 12) G.acc = 0;
+
+    // landing dust + yank trail + reel ticks
+    sim.p.forEach((q, i) => {
+      const pv = G.prev[i];
+      if (q.onGround && !pv.ground && pv.vy > 140) puff(q.x + q.w / 2, q.y + q.h, 4, C.cream, 36, 100, 0.25, 2);
+      pv.ground = q.onGround; pv.vy = q.vy;
+      if (q.ghost) puff(q.x + q.w / 2, q.y + q.h / 2, 1, i === 0 ? C.yellow : C.red, 20, 0, 0.3, 2);
+    });
+    if (sim.chaser) {
+      const c = sim.chaser, near = c.kind === 'up' ? (VH - c.pos) > -40 : (c.pos - (G.cam + VW)) < 220;
+      if (near && c.delay <= 0) { G.shake = Math.max(G.shake, 0.035); G.growl = (G.growl || 0) - dt; if (G.growl <= 0) { G.growl = 1.1; if (c.kind === 'up') tone(90, 55, 0.4, 'triangle', 0.05); else tone(70, 38, 0.5, 'sawtooth', 0.05); } }
+    }
+    if (sim.reeling) { G.reelTick -= dt; if (G.reelTick <= 0) { SFX.tick(); G.reelTick = 0.09; } }
+
+    if (sim.done) {
+      G.mode = 'won'; G.winT = 0;
+      const ex = lv.exit; puff(ex.cx, ex.y + 12, 50, C.yellow, 140, 160, 1.2, 3); puff(ex.cx, ex.y + 12, 30, C.cream, 100, 120, 1.0, 2);
+      const best = save.levels[G.li];
+      const stars = sim.starCount, time = sim.time;
+      const isNew = !best || stars > best.stars || (stars === best.stars && time < best.time);
+      if (isNew) { save.levels[G.li] = { stars: Math.max(stars, best ? best.stars : 0), time: (best && best.stars > stars) ? best.time : time }; writeSave(); }
+      G.result = { stars, time, best: save.levels[G.li], isNew, faults: sim.deathsBy.slice() };
+    }
+  } else if (G.mode === 'won') {
+    G.winT += dt;
+    if (G.winT > 1.0) G.mode = 'complete';
+  }
+
+  // camera follows the pair
+  const p = sim.p, mid = (p[0].x + p[1].x) / 2 + 5;
+  const target = clamp(mid - VW / 2, 0, Math.max(0, lv.pixelW - VW));
+  G.cam += (target - G.cam) * (1 - Math.exp(-dt * 7));
+}
+
+// ---- drawing the world ----
+function drawFlag(cp, camX, active, t) {
+  const x = Math.round(cp.cx - camX), y = cp.floorY;
+  rect(x - 2, y - 27, 4, 28, C.ink); rect(x - 1, y - 26, 2, 26, C.cream); rect(x - 2, y - 27, 4, 2, C.stone);
+  const wave = Math.floor(Math.sin(t * 6) * 1.2);
+  const col = active ? C.yellow : C.steel;
+  for (let r = -1; r < 9; r++) { const w = 11 - Math.abs(r - 3) * 2; if (w > -2) rect(x + 1, y - 25 + r, Math.max(1, w + 2) + (r > 2 ? wave : 0), 1, C.ink); }
+  for (let r = 0; r < 8; r++) { const w = 11 - Math.abs(r - 3) * 2; if (w > 0) rect(x + 1, y - 25 + r, w + (r > 2 ? wave : 0), 1, col); }
+  if (!active) rect(x + 2, y - 25, 3, 1, C.cream);
+}
+function drawExit(ex, camX, t, sim) {
+  const x = Math.round(ex.x - camX), y = ex.y;
+  rect(x, y, 32, 32, C.ink); rect(x + 2, y + 2, 28, 30, C.stone);
+  rect(x + 4, y + 4, 24, 28, C.navy);
+  const pulse = Math.floor(t * 4) % 2;
+  rect(x + 6, y + 6, 20, 26, pulse ? C.blue : C.aqua);
+  rect(x + 10, y + 10, 12, 22, pulse ? C.aqua : C.cream);
+  if (sim) { const fill = Math.round(26 * clamp(sim.exitTimer / CFG.exitHold, 0, 1)); if (fill > 0) rect(x + 6, y + 32 - fill, 20, fill, C.yellow); }
+  txt('EXIT', x + 16, y - 11, { size: 8, align: 'center', color: C.cream });
+  if (sim && sim.inExit === 1) txt('WAITING...', x + 16, y - 21, { size: 8, align: 'center', color: C.yellow });
+}
+function drawBullet(b, camX, t) {
+  const x = Math.round(b.x - camX) - 6, y = Math.round(b.y) - 4, d = b.dir;
+  rect(d > 0 ? x - 4 : x + 12, y + 2, 4, 4, Math.floor(t * 20) % 2 ? C.orange : C.yellow);
+  rect(x - 1, y, 14, 8, C.steel); rect(d > 0 ? x + 12 : x - 1, y + 1, 1, 6, C.steel);
+  if (d > 0) { rect(x, y + 1, 10, 6, C.ink); rect(x + 10, y + 2, 2, 4, C.ink); } else { rect(x + 2, y + 1, 10, 6, C.ink); rect(x, y + 2, 2, 4, C.ink); }
+  rect(d > 0 ? x + 6 : x + 3, y + 2, 3, 2, C.cream); rect(d > 0 ? x + 8 : x + 3, y + 2, 1, 2, C.red);
+  rect(d > 0 ? x + 1 : x + 4, y + 5, 6, 1, '#4a4a5a');
+}
+
+function drawMonster(pos, camX, t) {
+  const sx = Math.round(pos - camX);
+  if (sx > VW + 30) return;
+  const wob = Math.round(Math.sin(t * 5) * 2), x0 = sx + wob, wid = Math.max(40, VW - x0 + 40);
+  rect(x0 + 10, 20, wid, VH - 20, '#4a7a2a');
+  for (let i = 0; i < 12; i++) rect(x0 + 130 + i * 64, 20, 8, VH - 20, '#365a20');
+  rect(x0 + 10, 18, wid, 3, C.ink); rect(x0 + 7, 20, 3, VH, C.ink);
+  rect(x0, 56, 60, 200, '#5f9a34'); rect(x0 - 3, 56, 3, 200, C.ink); rect(x0, 53, 62, 3, C.ink);
+  rect(x0 + 60, 56, 3, 62, C.ink);
+  const gn = Math.floor(Math.abs(Math.sin(t * 5)) * 6);
+  rect(x0, 118, 56, 92, '#12060f');
+  for (let i = 0; i < 4; i++) {
+    const tx = x0 + 1 + i * 13;
+    rect(tx + 1, 118 + gn, 8, 6, C.cream); rect(tx + 2, 124 + gn, 6, 4, C.cream); rect(tx + 3, 128 + gn, 4, 3, C.cream);
+    rect(tx + 1, 204 - gn, 8, 6, C.cream); rect(tx + 2, 200 - gn, 6, 4, C.cream); rect(tx + 3, 197 - gn, 4, 3, C.cream);
+  }
+  rect(x0 + 18, 190 - gn, 32, 8, C.red);
+  rect(x0 + 8, 210, 2, 10 + Math.floor((Math.sin(t * 3) + 1) * 8), C.cream);
+  [64, 98].forEach(o => {
+    const ex = x0 + o;
+    rect(ex - 2, 66, 26, 26, C.ink); rect(ex, 68, 22, 22, C.yellow); rect(ex + 8, 68, 6, 22, C.red); rect(ex + 9, 71, 4, 16, C.ink);
+    rect(ex - 3, 60, 28, 5, C.ink);
+  });
+  rect(x0 - 16, 236, 30, 9, '#5f9a34'); rect(x0 - 20, 238, 6, 5, C.cream);
+  rect(x0 - 12, 250, 26, 9, '#5f9a34'); rect(x0 - 16, 252, 6, 5, C.cream);
+}
+function drawGoo(y, camX, t) {
+  if (y > VH + 12) return;
+  const top = Math.round(y);
+  rect(0, top + 8, VW, VH - top, '#0d3036');
+  for (let x = 0; x < VW; x += 4) {
+    const wy = Math.round(top + Math.sin((x + camX) * 0.05 + t * 3) * 3);
+    rect(x, wy, 4, VH - wy, '#1a6a66'); rect(x, wy, 4, 2, '#9ad8d0');
+    if (((x + Math.round(camX)) / 4 | 0) % 6 === 0) { rect(x, wy - 5, 4, 5, C.cream); rect(x + 1, wy - 8, 2, 3, C.cream); }
+  }
+  for (let k = -1; k < 5; k++) {
+    const ex = Math.round(k * 150 + 70 - (camX % 150)), ey = Math.round(top + 26 + Math.sin(t * 2 + k) * 4);
+    rect(ex - 2, ey - 2, 24, 22, C.ink); rect(ex, ey, 20, 18, C.cream); rect(ex + 6, ey + 2, 8, 14, C.red); rect(ex + 8, ey + 4, 4, 10, C.ink);
+  }
+}
+function drawPlayer(q, i, camX, t) {
+  if (q.inv > 0 && !q.ghost && Math.floor(t * 14) % 2 === 0) return;
+  const spr = (i === 0 ? SPR.dot : SPR.square)[q.face > 0 ? 1 : 0];
+  ctx.drawImage(spr, Math.round(q.x - camX) - 1, Math.round(q.y) - 1);
+}
+
+function drawWorld() {
+  const sim = G.sim, lv = LEVELS[G.li], th = lv.theme;
+  let camX = Math.round(G.cam);
+  const sh = G.shake > 0 ? (Math.random() - 0.5) * 6 * (G.shake / 0.25) : 0;
+  ctx.save(); ctx.translate(Math.round(sh), 0);
+  drawBackground(th, camX, G.t);
+  const tc = tilesFor(G.li);
+  ctx.drawImage(tc, camX, 0, VW, VH, 0, 0, VW, VH);
+  if (sim.chaser) { if (sim.chaser.kind === 'up') drawGoo(sim.chaser.pos, camX, G.t); else drawMonster(sim.chaser.pos, camX, G.t); }
+
+  lv.checkpoints.forEach(cp => drawFlag(cp, camX, sim.cp.tx === cp.tx && sim.cp.floorY === cp.floorY, G.t));
+  drawExit(lv.exit, camX, G.t, sim);
+  sim.stars.forEach((s, k) => { if (!s.got) drawStarPat(Math.round(s.x - camX) - 4, Math.round(s.y - 4 + Math.sin(G.t * 4 + k) * 1.5), C.yellow, C.cream, 1, true); });
+
+  sim.bullets.forEach(bl => drawBullet(bl, camX, G.t));
+  const a = sim.p[0], b = sim.p[1];
+  const ax = a.x + a.w / 2 - camX, ay = a.y + a.h / 2, bx = b.x + b.w / 2 - camX, by = b.y + b.h / 2;
+  const yanking = !!(a.ghost || b.ghost);
+  drawRope(ax, ay, bx, by, CFG.ropeLen, yanking ? 30 : sim.stretch, sim.reeling && !yanking, G.t);
+  drawPlayer(a, 0, camX, G.t); drawPlayer(b, 1, camX, G.t);
+  drawParts(camX);
+  ctx.restore();
+}
+
+function drawHUD() {
+  const sim = G.sim, lv = LEVELS[G.li];
+  ctx.globalAlpha = 0.5; rect(0, 0, VW, 16, C.ink); ctx.globalAlpha = 1;
+  txt((G.li + 1) + ' ' + lv.name, 6, 5);
+  const total = lv.stars.length;
+  for (let i = 0; i < total; i++) {
+    const got = i < sim.starCount;
+    drawStarPat(VW / 2 - total * 6 + i * 12, 4, got ? C.yellow : C.stone, got ? C.cream : null, 1, true);
+  }
+  txt(fmtTime(sim.time), VW - 6, 5, { align: 'right' });
+  // whose fault? deaths per player
+  const fx = VW - 6, db = sim.deathsBy;
+  txt(String(db[1]), fx, 22, { align: 'right', color: C.red, shadowColor: C.ink });
+  const w1 = String(db[1]).length * 8;
+  ctx.drawImage(SPR.square[1], fx - w1 - 14, 20);
+  txt(String(db[0]), fx - w1 - 22, 22, { align: 'right', color: C.yellow });
+  const w0 = String(db[0]).length * 8;
+  ctx.drawImage(SPR.dot[1], fx - w1 - 22 - w0 - 14, 20);
+  // hint text at the start of a level
+  if (G.hintT < 9 && lv.hint && lv.hint.length) {
+    const al = G.hintT > 7.5 ? 1 - (G.hintT - 7.5) / 1.5 : 1;
+    ctx.globalAlpha = clamp(al, 0, 1);
+    let hw = 0; ctx.font = '8px "Press Start 2P", monospace'; lv.hint.forEach(l => { hw = Math.max(hw, ctx.measureText(l).width); });
+    ctx.globalAlpha = clamp(al, 0, 1) * 0.6; rect(VW / 2 - hw / 2 - 8, 229, hw + 16, lv.hint.length * 13 + 4, C.ink);
+    ctx.globalAlpha = clamp(al, 0, 1);
+    lv.hint.forEach((line, i) => txt(line, VW / 2, 232 + i * 13, { align: 'center', color: i === 0 ? C.yellow : C.cream }));
+    ctx.globalAlpha = 1;
+  }
+  txt('R: RESTART   Y: CHECKPOINT   ESC: MENU', 6, 262, { color: C.cream });
+  // floor countdown (hanging below the lowest ground)
+  sim.p.forEach(q => {
+    if (q.low > 0.05) {
+      const n = Math.ceil(CFG.lowTime - q.low), px = clamp(Math.round(q.x + q.w / 2 - G.cam), 14, VW - 14);
+      txt(String(n), px, 164, { size: 24, align: 'center', color: C.cream, shadowColor: C.red });
+      txt('HAUL THEM UP!', px, 194, { align: 'center', color: C.yellow });
+    }
+  });
+  // stuck? the player decides
+  if (sim.p.some(q => q.air > 2.5 && !q.ghost) && Math.floor(G.t * 2) % 2 === 0) txt('STUCK? PRESS R TO RESTART', VW / 2, 24, { align: 'center', color: C.yellow });
+  // monster warning when it is just off-screen
+  const ch = sim.chaser;
+  if (ch && ch.kind === 'left') {
+    const gap = ch.pos - (G.cam + VW);
+    if (gap > 0 && gap < 320 && Math.floor(G.t * 4) % 2 === 0) { rect(VW - 34, 104, 28, 36, C.ink); rect(VW - 32, 106, 24, 32, C.red); txt('!', VW - 20, 112, { size: 16, align: 'center', color: C.cream, shadow: false }); }
+  }
+}
+
+function drawComplete() {
+  const r = G.result; if (!r) return;
+  ctx.globalAlpha = 0.6; rect(0, 0, VW, VH, C.ink); ctx.globalAlpha = 1;
+  const w = 300, h = 170, x = (VW - w) / 2, y = 52;
+  rect(x - 2, y - 2, w + 4, h + 4, C.ink); rect(x, y, w, h, C.navy); rect(x + 3, y + 3, w - 6, h - 6, '#1d2150');
+  txt('LEVEL CLEAR!', VW / 2, y + 14, { size: 16, align: 'center', color: C.yellow });
+  const total = LEVELS[G.li].stars.length;
+  for (let i = 0; i < total; i++) { const got = i < r.stars; drawStarPat(VW / 2 - total * 14 + i * 28 + 2, y + 42, got ? C.yellow : C.stone, got ? C.cream : null, 3, true); }
+  txt('TIME ' + fmtTime(r.time), VW / 2, y + 74, { align: 'center' });
+  const bst = r.best;
+  txt(r.isNew ? 'NEW BEST!' : ('BEST ' + fmtTime(bst.time) + '  ' + bst.stars + '/' + total + ' STARS'), VW / 2, y + 90, { align: 'center', color: r.isNew ? C.yellow : C.steel });
+  const f = r.faults, verdict = (f[0] + f[1] === 0) ? 'FLAWLESS! NOBODY FELL!' : f[0] > f[1] ? "DOT'S FAULT!" : f[1] > f[0] ? "SQUARE'S FAULT!" : 'BOTH TO BLAME!';
+  ctx.drawImage(SPR.dot[1], VW / 2 - 118, y + 106); txt(String(f[0]), VW / 2 - 102, y + 108, { color: C.yellow });
+  txt(verdict, VW / 2 + 8, y + 108, { align: 'center', color: C.cream });
+  ctx.drawImage(SPR.square[1], VW / 2 + 106, y + 106); txt(String(f[1]), VW / 2 + 122, y + 108, { color: C.red });
+  const next = G.li + 1 < LEVELS.length;
+  txt(next ? 'ENTER: NEXT LEVEL' : 'ENTER: LEVEL SELECT', VW / 2, y + 130, { align: 'center' });
+  txt('R: REPLAY   ESC: MENU', VW / 2, y + 146, { align: 'center', color: C.steel });
+}
+
+// ---- menu ----
+function drawMenu() {
+  drawBackground(0, G.t * 18, G.t);
+  ctx.globalAlpha = 0.35; rect(0, 0, VW, VH, C.ink); ctx.globalAlpha = 1;
+  txt('TETHERED', VW / 2, 8, { size: 24, align: 'center', color: C.yellow, shadowColor: C.red });
+  txt('TWO PLAYERS. ONE ROPE. ONE KEYBOARD.', VW / 2, 38, { align: 'center' });
+  // the two friends, hopping on the title
+  const base = 76, ph = G.t * 1.6;
+  const hopA = Math.max(0, Math.sin(ph * Math.PI)) * 9, hopB = Math.max(0, Math.sin((ph - 0.25) * Math.PI)) * 9;
+  const ax = 196, bx = 284;
+  rect(ax - 20, base + 1, 128, 3, C.ink);
+  const ay = base - 6 - hopA, by = base - 6 - hopB;
+  drawRope(ax, ay, bx, by, 90, Math.max(0, Math.hypot(bx - ax, ay - by) - 90), false, G.t);
+  ctx.drawImage(SPR.dot[1], ax - 6, ay - 6); ctx.drawImage(SPR.square[0], bx - 6, by - 6);
+
+  for (let i = 0; i < LEVELS.length; i++) {
+    const c = cardRect(i), sel = i === G.sel, un = isUnlocked(i), sv = save.levels[i];
+    rect(c.x - 2, c.y - 2, c.w + 4, c.h + 4, sel ? (Math.floor(G.t * 4) % 2 ? C.yellow : C.cream) : C.ink);
+    rect(c.x, c.y, c.w, c.h, un ? C.navy : C.slate);
+    rect(c.x + 2, c.y + 2, c.w - 4, c.h - 4, un ? '#1d2150' : '#38343a');
+    txt(String(i + 1), c.x + 8, c.y + 6, { color: un ? C.yellow : C.stone });
+    const total = LEVELS[i].stars.length;
+    for (let k = 0; k < total; k++) { const got = sv && k < sv.stars; drawStarPat(c.x + 24 + k * 11, c.y + 6, got ? C.yellow : C.stone, got ? C.cream : null, 1, true); }
+    txt(LEVELS[i].name, c.x + 8, c.y + 19, { color: un ? C.cream : C.stone, shadow: un });
+    if (!un) txt('LOCKED', c.x + 8, c.y + 33, { color: C.stone, shadow: false });
+    else txt(sv ? fmtTime(sv.time) : '--:--.-', c.x + 8, c.y + 33, { color: sv ? C.cream : C.steel });
+  }
+  txt('ARROWS/WASD CHOOSE  ENTER PLAY  M SOUND  F FULL', VW / 2, 258, { align: 'center', color: C.steel });
+}
+
+function render() {
+  ctx.imageSmoothingEnabled = false;
+  if (G.mode === 'menu') { drawMenu(); return; }
+  drawWorld(); drawHUD();
+  if (G.mode === 'complete') drawComplete();
+}
+
+// ---- main loop ----
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt); render();
+  requestAnimationFrame(frame);
+}
+(function boot() {
+  const m = /[?&]level=(\d+)/.exec(location.search);
+  if (m) { const n = parseInt(m[1], 10) - 1; if (n >= 0 && n < LEVELS.length) startLevel(n); }
+  if (document.fonts && document.fonts.load) document.fonts.load('8px "Press Start 2P"').catch(() => { });
+  requestAnimationFrame(frame);
+})();
+
+</script>
+</body>
+</html>
